@@ -52,6 +52,7 @@ const (
 	errUpdateManagedAnnotations = "cannot update managed resource annotations"
 	errCreateIncomplete         = "cannot determine creation result - remove the " + meta.AnnotationKeyExternalCreatePending + " annotation if it is safe to proceed"
 	errReconcileConnect         = "connect failed"
+	errReconcileDisconnect      = "disconnect failed"
 	errReconcileObserve         = "observe failed"
 	errReconcileCreate          = "create failed"
 	errReconcileUpdate          = "update failed"
@@ -60,7 +61,7 @@ const (
 
 // Event reasons.
 const (
-	reasonCannotConnect       event.Reason = "CannotConnectToProvider"
+	reasonCannotDisconnect    event.Reason = "CannotDisconnectToProvider"
 	reasonCannotInitialize    event.Reason = "CannotInitializeManagedResource"
 	reasonCannotResolveRefs   event.Reason = "CannotResolveResourceReferences"
 	reasonCannotObserve       event.Reason = "CannotObserveExternalResource"
@@ -187,6 +188,46 @@ type ExternalConnecter interface {
 	Connect(ctx context.Context, mg resource.Managed) (ExternalClient, error)
 }
 
+// An ExternalDisconnecter disconnect from provider.
+type ExternalDisconnecter interface {
+	// Disconnect from the provider and close an ExternalClient.
+	Disconnect(ctx context.Context) error
+}
+
+// NopDisconnect do nothing. Never returns error.
+func NopDisconnect(_ context.Context) error {
+	return nil
+}
+
+// closableExternalConnector is wrap ExternalConnecter in closableExternalConnector
+// with nop Disconnect.
+type closableExternalConnector struct {
+	c ExternalConnecter
+	d ExternalDisconnecter
+}
+
+// Connect call ExternalConnecter's Connect
+func (c *closableExternalConnector) Connect(ctx context.Context, mg resource.Managed) (ExternalClient, error) {
+	return c.c.Connect(ctx, mg)
+}
+
+// Disconnect call ExternalDisconnecter's Disconnect
+func (c *closableExternalConnector) Disconnect(ctx context.Context) error {
+	return c.d.Disconnect(ctx)
+}
+
+// NewExternalConnectorClosable wraps ExternalConnecter in ExternalConnecterClosable
+func NewExternalConnectorClosable(c ExternalConnecter, d ExternalDisconnecter) ExternalConnecterClosable {
+	return &closableExternalConnector{c, d}
+}
+
+// An ExternalConnecterClosable produces a new ExternalClient given the supplied
+// Managed resource.
+type ExternalConnecterClosable interface {
+	ExternalConnecter
+	ExternalDisconnecter
+}
+
 // An ExternalConnectorFn is a function that satisfies the ExternalConnecter
 // interface.
 type ExternalConnectorFn func(ctx context.Context, mg resource.Managed) (ExternalClient, error)
@@ -195,6 +236,15 @@ type ExternalConnectorFn func(ctx context.Context, mg resource.Managed) (Externa
 // produce an ExternalClient.
 func (ec ExternalConnectorFn) Connect(ctx context.Context, mg resource.Managed) (ExternalClient, error) {
 	return ec(ctx, mg)
+}
+
+// An ExternalDisconnectorFn is a function that satisfies the ExternalConnecter
+// interface.
+type ExternalDisconnectorFn func(ctx context.Context) error
+
+// Disconnect from provider and close an ExternalClient.
+func (ed ExternalDisconnectorFn) Disconnect(ctx context.Context) error {
+	return ed(ctx)
 }
 
 // An ExternalClient manages the lifecycle of an external resource.
@@ -267,6 +317,11 @@ type NopConnecter struct{}
 // Connect returns a NopClient. It never returns an error.
 func (c *NopConnecter) Connect(_ context.Context, _ resource.Managed) (ExternalClient, error) {
 	return &NopClient{}, nil
+}
+
+// Disconnect do nothing. It never returns an error.
+func (c *NopConnecter) Disconnect(_ context.Context) error {
+	return nil
 }
 
 // A NopClient does nothing.
@@ -408,12 +463,12 @@ func defaultMRManaged(m manager.Manager) mrManaged {
 }
 
 type mrExternal struct {
-	ExternalConnecter
+	ExternalConnecterClosable
 }
 
 func defaultMRExternal() mrExternal {
 	return mrExternal{
-		ExternalConnecter: &NopConnecter{},
+		ExternalConnecterClosable: &NopConnecter{},
 	}
 }
 
@@ -456,7 +511,15 @@ func WithCreationGracePeriod(d time.Duration) ReconcilerOption {
 // used to sync and delete external resources.
 func WithExternalConnecter(c ExternalConnecter) ReconcilerOption {
 	return func(r *Reconciler) {
-		r.external.ExternalConnecter = c
+		r.external.ExternalConnecterClosable = NewExternalConnectorClosable(c, ExternalDisconnectorFn(NopDisconnect))
+	}
+}
+
+// WithExternalConnecterClosable specifies how the Reconciler should connect and disconnect to the API
+// used to sync and delete external resources.
+func WithExternalConnecterClosable(c ExternalConnecterClosable) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.external.ExternalConnecterClosable = c
 	}
 }
 
@@ -673,7 +736,7 @@ func (r *Reconciler) Reconcile(_ context.Context, req reconcile.Request) (reconc
 		// condition. If not, we requeue explicitly, which will trigger
 		// backoff.
 		log.Debug("Cannot connect to provider", "error", err)
-		record.Event(managed, event.Warning(reasonCannotConnect, err))
+		record.Event(managed, event.Warning(reasonCannotDisconnect, err))
 		managed.SetConditions(xpv1.ReconcileError(errors.Wrap(err, errReconcileConnect)))
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
@@ -923,6 +986,13 @@ func (r *Reconciler) Reconcile(_ context.Context, req reconcile.Request) (reconc
 		log.Debug("Cannot publish connection details", "error", err)
 		record.Event(managed, event.Warning(reasonCannotPublish, err))
 		managed.SetConditions(xpv1.ReconcileError(err))
+		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+	}
+
+	if err := r.external.Disconnect(ctx); err != nil {
+		log.Debug("Cannot disconnect from provider", "error", err)
+		record.Event(managed, event.Warning(reasonCannotDisconnect, err))
+		managed.SetConditions(xpv1.ReconcileError(errors.Wrap(err, errReconcileDisconnect)))
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 

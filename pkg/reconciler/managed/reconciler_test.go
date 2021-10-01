@@ -286,6 +286,31 @@ func TestReconciler(t *testing.T) {
 			},
 			want: want{result: reconcile.Result{Requeue: true}},
 		},
+		"ExternalDisconnectError": {
+			reason: "Errors disconnecting from the provider should trigger a requeue after a short wait.",
+			args: args{
+				m: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet:          test.NewMockGetFn(nil),
+						MockStatusUpdate: test.NewMockStatusUpdateFn(nil),
+					},
+					Scheme: fake.SchemeWith(&fake.Managed{}),
+				},
+				mg: resource.ManagedKind(fake.GVK(&fake.Managed{})),
+				o: []ReconcilerOption{
+					WithInitializers(),
+					WithExternalConnecterClosable(NewExternalConnectorClosable(
+						ExternalConnectorFn(func(_ context.Context, mg resource.Managed) (ExternalClient, error) {
+							return nil, nil
+						}),
+						ExternalDisconnectorFn(func(_ context.Context) error {
+							return errBoom
+						}),
+					)),
+				},
+			},
+			want: want{result: reconcile.Result{Requeue: true}},
+		},
 		"ExternalObserveError": {
 			reason: "Errors observing the external resource should trigger a requeue after a short wait.",
 			args: args{
