@@ -141,6 +141,7 @@ func (u *ProviderConfigUsageTracker) Track(ctx context.Context, mg Managed) erro
 	}
 
 	pcu.SetName(string(mg.GetUID()))
+	pcu.SetNamespace(mg.GetNamespace())
 	pcu.SetLabels(map[string]string{xpv1.LabelKeyProviderName: ref.Name})
 	pcu.SetOwnerReferences([]metav1.OwnerReference{meta.AsController(meta.TypedReferenceTo(mg, gvk))})
 	pcu.SetProviderConfigReference(xpv1.Reference{Name: ref.Name})
